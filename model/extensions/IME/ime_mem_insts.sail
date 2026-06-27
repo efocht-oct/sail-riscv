@@ -166,11 +166,19 @@ function clause execute VMTSTYPE(lambda_field, L, mode, vm, rs2, rs1, vs3) = {
 }
 
 
-// Shared W=1 integer GEMM executor for vmmacc.vv. This mirrors the
-// specification's int_gemm helper: decode geometry from vtype/vl, loop over
-// active C columns j, rows i, and K, and use mat_A/mat_B/mat_C indexing.
-function execute_ime_vmmacc_w1(
+// Shared unscaled integer GEMM executor for the vmmacc.vv family. This mirrors
+// the specification's int_gemm helper: decode geometry from vtype/vl plus the
+// per-instruction widening factor W, loop over active C columns j, rows i, and
+// the effective K dimension, and use mat_A/mat_B/mat_C indexing.
+//
+// `EEW_C` is the C accumulator (and storage) element width SEW. `W` is the
+// widening factor: W=1 is non-widening (vmmacc.vv); W=2/4/8 select the widening
+// variants (vwmmacc/vqmmacc/v8wmmacc), each consuming W packed narrow input
+// elements of width EEW = SEW/W per SEW-bit storage element. Only W=1 is
+// currently dispatched; the W>1 paths are exercised by later widening tasks.
+function execute_ime_int_gemm(
   EEW_C : sew_bitsize,
+  W : nat,
   lambda_value : nat,
   LMUL : nat,
   signed_A : bool,
@@ -179,23 +187,38 @@ function execute_ime_vmmacc_w1(
   vs2 : vregidx,
   vd : vregidx
 ) -> ExecutionResult = {
-  let epr_C : nat = vlen / EEW_C;
-  let K_eff : nat = lambda_value * LMUL;
   assert(lambda_value > 0);
   assert(LMUL > 0);
+  assert(W > 0);
   assert(EEW_C * lambda_value > 0);
   assert(EEW_C * lambda_value * lambda_value > 0);
+  let epr_C : nat = vlen / EEW_C;
+  let K_eff : nat = lambda_value * W * LMUL;
   assert(K_eff > 0);
+  // Number of SEW-bit storage elements per matrix row along the K direction.
+  // W narrow logical elements are packed into each storage element, so the
+  // physical storage geometry is identical to the non-widening (W=1) case.
+  let storage_K : nat = lambda_value * LMUL;
+  assert(storage_K > 0);
   let M : nat = vlen / (EEW_C * lambda_value);
   let N_max : nat = M;
   let EMUL_C : nat = vlen / (EEW_C * lambda_value * lambda_value);
-  let N : nat = unsigned(vl) / K_eff;
+  // VL is counted in C/storage-width elements, so the active C column count
+  // follows the specification Sail helper's vl_div = lambda * LMUL rather
+  // than the widened logical K_eff = lambda * W * LMUL.
+  let N : nat = unsigned(vl) / storage_K;
   let EMUL_C_pow = ime_group_size_to_pow(EMUL_C);
+  // Logical input element width; W such elements pack into one SEW storage slot.
+  let EEW : nat = EEW_C / W;
 
+  if W != 1 & W != 2 & W != 4 & W != 8 then return Illegal_Instruction();
+  if EEW_C % W != 0 then return Illegal_Instruction();
+  if not(ime_int_eew_supported(EEW)) then return Illegal_Instruction();
   if K_eff == 0 |
+     storage_K == 0 |
      M == 0 |
      N == 0 |
-     unsigned(vl) % K_eff != 0 |
+     unsigned(vl) % storage_K != 0 |
      N > N_max |
      not(ime_group_size_legal(EMUL_C)) |
      not(valid_reg_group(vd, EMUL_C_pow))
@@ -206,12 +229,14 @@ function execute_ime_vmmacc_w1(
       let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
       var acc : int = signed(read_single_element(EEW_C, c_flat, vd));
       foreach (k from 0 to (K_eff - 1)) {
-        let a_flat = ime_mat_A_idx(i, k, K_eff, LMUL, lambda_value, epr_C);
-        let b_flat = ime_mat_B_idx(k, j, K_eff, LMUL, lambda_value, epr_C);
-        let a_bits = read_single_element(EEW_C, a_flat, vs1);
-        let b_bits = read_single_element(EEW_C, b_flat, vs2);
-        let a_val = if signed_A then signed(a_bits) else unsigned(a_bits);
-        let b_val = if signed_B then signed(b_bits) else unsigned(b_bits);
+        let storage_col = ime_packed_storage_col(k, W);
+        let lane = ime_packed_lane(k, W);
+        let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
+        let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
+        let a_storage = unsigned(read_single_element(EEW_C, a_flat, vs1));
+        let b_storage = unsigned(read_single_element(EEW_C, b_flat, vs2));
+        let a_val = ime_packed_subelement_value(a_storage, lane, EEW, signed_A);
+        let b_val = ime_packed_subelement_value(b_storage, lane, EEW, signed_B);
         acc = acc + a_val * b_val
       };
       write_single_element(EEW_C, c_flat, vd, to_bits_unsafe(EEW_C, acc))
@@ -222,19 +247,13 @@ function execute_ime_vmmacc_w1(
   RETIRE_SUCCESS
 }
 
-// vmmacc.vv — non-widening integer matrix multiply-accumulate.
-// This is the first concrete member of the common IME GEMM family described
-// in the specification's Sail starting point under integrated-matrix-insns.
-union clause instruction = IMEVMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
-
-mapping clause encdec = IMEVMMACCTYPE(vm, vs2, vs1, vd)
-  <-> 0b111000 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b000 @ encdec_vreg(vd) @ 0b1010111
-  when currentlyEnabled(Ext_Zvvmm)
-
-mapping clause assembly = IMEVMMACCTYPE(vm, vs2, vs1, vd)
-  <-> "vmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
-
-function clause execute IMEVMMACCTYPE(vm, vs2, vs1, vd) = {
+// Shared dispatch for the unscaled integer vmmacc.vv family. The members differ
+// only in the per-instruction widening factor W (vmmacc.vv W=1, vwmmacc.vv W=2,
+// and later vqmmacc.vv W=4, v8wmmacc.vv W=8); they share the vm=1-only encoding,
+// vstart/vtype legality, LMUL-aligned input register groups, and the dispatch to
+// execute_ime_int_gemm on the C accumulator SEW. `vm=0` is reserved for the
+// microscaled integer-input FP-accumulate forms, which are not implemented.
+function execute_ime_int_mmacc(W : nat, vm : bits(1), vs2 : vregidx, vs1 : vregidx, vd : vregidx) -> ExecutionResult = {
   let SEW = get_sew();
   let LMUL_pow = get_lmul_pow();
   let lambda_value = ime_lambda_field_to_value(vtype[vlambda]);
@@ -253,9 +272,42 @@ function clause execute IMEVMMACCTYPE(vm, vs2, vs1, vd) = {
   then return Illegal_Instruction();
 
   match SEW {
-    8  => execute_ime_vmmacc_w1(8, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
-    16 => execute_ime_vmmacc_w1(16, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
-    32 => execute_ime_vmmacc_w1(32, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
-    64 => execute_ime_vmmacc_w1(64, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
+    8  => execute_ime_int_gemm(8, W, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
+    16 => execute_ime_int_gemm(16, W, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
+    32 => execute_ime_int_gemm(32, W, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
+    64 => execute_ime_int_gemm(64, W, lambda_nat, LMUL, signed_A, signed_B, vs1, vs2, vd),
   }
 }
+
+// vmmacc.vv — non-widening integer matrix multiply-accumulate.
+// This is the first concrete member of the common IME GEMM family described
+// in the specification's Sail starting point under integrated-matrix-insns.
+union clause instruction = IMEVMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEVMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b111000 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b000 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvmm)
+
+mapping clause assembly = IMEVMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "vmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEVMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_int_mmacc(1, vm, vs2, vs1, vd)
+
+// vwmmacc.vv — double-widening (W=2) integer matrix multiply-accumulate. A and B
+// hold SEW/2-bit logical elements, two packed per SEW-bit storage element, and C
+// accumulates at SEW. `vm=1` selects this unscaled integer form; `vm=0` is the
+// reserved vfwimmacc.vv microscaled encoding (not implemented), so it falls
+// through to the W-check / vm check in the shared dispatch and raises illegal.
+union clause instruction = IMEVWMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEVWMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b111001 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b000 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvmm)
+
+mapping clause assembly = IMEVWMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "vwmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEVWMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_int_mmacc(2, vm, vs2, vs1, vd)
+

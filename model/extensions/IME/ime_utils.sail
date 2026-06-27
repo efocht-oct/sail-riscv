@@ -136,3 +136,38 @@ function ime_mat_B_idx(k : nat, j : nat, K_eff : nat, LMUL : nat, lambda_value :
 
 function ime_mat_C_idx(i : nat, j : nat, N_max : nat, EMUL_C : nat, lambda_value : nat, epr : nat) -> nat =
   ime_tile_reg_idx(i * N_max + j, EMUL_C, lambda_value, epr)
+
+// A supported integer logical input element width EEW = SEW / W. Includes the
+// sub-byte Int4 width, which is packed two-per-byte in the storage element.
+function ime_int_eew_supported(eew : nat) -> bool =
+  eew == 4 | eew == 8 | eew == 16 | eew == 32 | eew == 64
+
+// Packed-input mapping for widening GEMM. A logical K-dimension index `k`
+// (0..K_eff-1) addresses one of `W` narrow elements packed into a single
+// `SEW`-bit storage element. The storage column selects which `SEW`-bit
+// storage element along the K direction, and the lane selects the subelement
+// within it. With W=1 this reduces to storage_col=k, lane=0.
+function ime_packed_storage_col(k : nat, W : nat) -> nat = {
+  assert(W > 0);
+  k / W
+}
+
+function ime_packed_lane(k : nat, W : nat) -> nat = {
+  assert(W > 0);
+  k % W
+}
+
+// Extract the value of logical subelement `lane` (0-based, little-endian lane
+// order) of width `eew` bits from an `sew`-bit storage element holding W=sew/eew
+// packed elements. Element k occupies bits [k*eew + eew-1 : k*eew], so for EEW=4
+// the even element is the lower nibble and the odd element the upper nibble,
+// matching the IME packing definition. `storage` is the unsigned value of the
+// `SEW`-bit storage element. With `is_signed` the eew-bit field is sign-extended,
+// otherwise zero-extended. For W=1 (lane=0, eew=sew) this reduces to a plain
+// signed/unsigned read of the whole storage element.
+function ime_packed_subelement_value(storage : nat, lane : nat, eew : nat, is_signed : bool) -> int = {
+  assert(eew > 0);
+  let modulus = 2 ^ eew;
+  let field = (storage / (2 ^ (lane * eew))) % modulus;
+  if is_signed & field >= modulus / 2 then field - modulus else field
+}
