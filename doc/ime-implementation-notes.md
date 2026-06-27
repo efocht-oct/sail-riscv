@@ -7,7 +7,8 @@ This is the status note for the initial Sail implementation loop for the draft R
 - Draft extension plumbing:
   - `Ext_Zvvmm` for integer matrix multiply-accumulate.
   - `Ext_Zvvmtls` for order-preserving tile load/store.
-  - `Ext_Zvvmttls` and `Ext_Zvvfmm` are registered for configuration/ISA-string plumbing, but their instructions are not implemented in this loop.
+  - `Ext_Zvvmttls` for transposing tile load/store.
+  - `Ext_Zvvfmm` is registered for configuration/ISA-string plumbing, but its instructions are not implemented in this loop.
 - IME `vtype` high fields:
   - `vlambda` in bits `XLEN-2:XLEN-4`.
   - `vbs` in bit `XLEN-5`.
@@ -22,14 +23,44 @@ This is the status note for the initial Sail implementation loop for the draft R
 - Order-preserving tile load/store:
   - `vmtl.v` and `vmts.v` decode for `Zvvmtls`.
   - Implemented for the standard vector element widths handled by the vector model (`SEW=8,16,32,64`).
-  - Uses the order-preserving memory address formula with `linesize = lambda * LMUL` and `mem_off = (i / linesize) * LD + (i % linesize)`.
+  - Uses the order-preserving memory address formula in `ime_tile_ordered_mem_off`: `linesize = lambda * LMUL`, `mem_off = (i / linesize) * LD + (i % linesize)`.
+  - `rs2=x0` selects the natural leading dimension `LD = lambda * LMUL`.
+- Transposing tile load/store:
+  - `vmttl.v` and `vmtts.v` decode for `Zvvmttls`. Decode is mode-gated: order-preserving mode (`mode=00`) requires `Zvvmtls`; transposing mode (`mode=01`) requires `Zvvmttls`. Neither mode requires both extensions.
+  - Implemented for `SEW=8,16,32,64`, sharing the same mask, tail, prestart, `vstart`, and memory-exception behavior as `vmtl.v`/`vmts.v`.
+  - The active storage-element tile shape is `cols = lambda * LMUL` columns by `rows = VL / cols` rows.
+  - Uses the transposing memory address formula in `ime_tile_transposed_mem_off`: `mem_off = (i % cols) * LD + (i / cols)`. For a 2x2 tile with `LD=4` this yields offsets `[0,4,1,5]`, versus `[0,1,4,5]` for the order-preserving traversal.
+  - `rs2=x0` selects the natural leading dimension `LD = VLEN / (SEW * lambda)`.
+  - Transposing transposes `SEW`-bit storage elements only; it does not unpack, transpose, or repack `W>1` logical elements that may be packed inside a `SEW`-bit storage element.
+  - Inactive/tail destination elements for `vmttl.v` remain undisturbed; inactive/tail elements for `vmtts.v` do not write memory or fault.
 - Basic non-widening integer matrix multiply-accumulate:
   - `vmmacc.vv` decodes for `Zvvmm`.
   - Implemented for W=1, `SEW=8,16,32,64`, integer LMUL `1,2,4,8` where the derived accumulator group is legal.
-  - Uses the specification-shaped geometry: `K_eff = lambda * LMUL`, `M = VLEN / (SEW * lambda)`, `N = VL / K_eff`, `N_max = M`, `EMUL_C = VLEN / (SEW * lambda^2)`.
-  - Uses `mat_A_idx`, `mat_B_idx`, and `mat_C_idx` helpers based on `tile_reg_idx`.
   - `altfmt_A=0`/`altfmt_B=0` select signed operands; `altfmt_A=1`/`altfmt_B=1` select unsigned operands.
   - Accumulation is written back modulo the destination SEW.
+- Generalized integer GEMM executor (`execute_ime_int_gemm`):
+  - `vmmacc.vv` now dispatches through this shared executor with widening factor `W=1`; the W=1 result is byte-for-byte identical to the previous dedicated path.
+  - Takes a `widening_factor W` argument and uses the specification-shaped geometry: `K_eff = lambda * W * LMUL`, `storage_K = lambda * LMUL`, `M = VLEN / (SEW * lambda)`, `N = VL / storage_K`, `N_max = M`, `EMUL_C = VLEN / (SEW * lambda^2)` based on the C accumulator SEW.
+  - The physical storage geometry is the same for all `W`: each matrix row holds `storage_K = lambda * LMUL` `SEW`-bit storage elements along K, addressed via `mat_A_idx`/`mat_B_idx`/`mat_C_idx` (built on `tile_reg_idx`).
+  - For `W>1` each `SEW`-bit storage element packs `W` logical input elements of width `EEW = SEW / W`. Logical index `k` maps to storage column `k / W` and lane `k % W` (`ime_packed_storage_col`/`ime_packed_lane`); `ime_packed_subelement_value` extracts the lane in little-endian lane order and sign- or zero-extends it per `altfmt_A/B`. Element `k` occupies bits `[k*EEW + EEW-1 : k*EEW]`, including the sub-byte Int4 (`EEW=4`) nibble packing (even element = lower nibble, odd element = upper nibble).
+  - Legality checks: `W in {1,2,4,8}`, `SEW % W == 0`, `EEW = SEW/W` a supported integer logical width (`{4,8,16,32,64}`), and `VL % K_eff == 0`, in addition to the existing `M`/`N`/`N_max`/`EMUL_C`/register-group checks.
+  - Accumulation stays modulo `2^SEW`; C read/write indexing stays on `SEW` storage elements.
+  - `vwmmacc.vv` (W=2), `vqmmacc.vv` (W=4), and `v8wmmacc.vv` (W=8) are now enabled and dispatch through this executor.
+- Double-widening integer matrix multiply-accumulate (`vwmmacc.vv`, W=2):
+  - Decodes for `Zvvmm` at funct6 `0x39`, OPIVV, `vm=1`. `vm=0` is the reserved `vfwimmacc.vv` microscaled form and raises illegal instruction.
+  - Shares `execute_ime_int_mmacc(W, ...)` with `vmmacc.vv`; only the widening factor differs (`W=1` vs `W=2`).
+  - Supported W=2 rows (all representable with the current packed-subelement helper, including the sub-byte nibble Int4 row): Int4→Int8 (`SEW=8`), Int8→Int16 (`SEW=16`), Int16→Int32 (`SEW=32`), Int32→Int64 (`SEW=64`). Each `SEW`-bit storage element packs two `SEW/2`-bit logical inputs.
+  - Signedness per operand follows `altfmt_A`/`altfmt_B` (0=signed, 1=unsigned); mixed-sign combinations are supported.
+- Quad-widening integer matrix multiply-accumulate (`vqmmacc.vv`, W=4):
+  - Decodes for `Zvvmm` at funct6 `0x3a`, OPIVV, `vm=1`. `vm=0` is the reserved `vfqmmacc.vv` microscaled form and raises illegal instruction.
+  - Shares `execute_ime_int_mmacc(W, ...)` with `vmmacc.vv`/`vwmmacc.vv`; only the widening factor differs (`W=4`).
+  - Supported W=4 rows: Int4→Int16 (`SEW=16`), Int8→Int32 (`SEW=32`, the common `vqwmmacc`/Ozaki-style path), and Int16→Int64 (`SEW=64`). Each `SEW`-bit storage element packs four `SEW/4`-bit logical inputs. `SEW=8` (which would imply the reserved `EEW=2`) raises illegal instruction via the `ime_int_eew_supported` check, matching the spec. The Int4→Int16 row uses the same packed-nibble helper as the W=2 Int4 row, so it is fully implemented and tested with no Int4 limitation.
+  - Signedness per operand follows `altfmt_A`/`altfmt_B` (0=signed, 1=unsigned); all four combinations (signed/signed, unsigned/signed, unsigned/unsigned, signed/unsigned) are covered by the tests.
+- Octuple-widening integer matrix multiply-accumulate (`v8wmmacc.vv`, W=8):
+  - Decodes for `Zvvmm` at funct6 `0x3b`, OPIVV, `vm=1`. `vm=0` is the reserved `vf8wimmacc.vv` microscaled form and raises illegal instruction.
+  - Shares `execute_ime_int_mmacc(W, ...)` with the other unscaled integer GEMM instructions; only the widening factor differs (`W=8`).
+  - Supported W=8 rows: Int4→Int32 (`SEW=32`) and Int8→Int64 (`SEW=64`). `SEW=8`/`SEW=16` imply reserved EEW values and raise illegal instruction via the shared EEW legality check.
+  - The targeted tests cover signed and mixed-sign paths, including an `LMUL=2` case to exercise `K_eff = lambda * W * LMUL` with `storage_K = lambda * LMUL`.
 
 ## Targeted tests
 
@@ -38,11 +69,34 @@ The initial IME tests live under `test/first_party/src/`:
 - `test_ime_tile_ls.S`
   - Configures `SEW=32`, `LMUL=1`, `lambda=2`, `VL=4`, and `LD=4`.
   - Checks `vmtl.v` loads offsets `[0,1,4,5]` and `vmts.v` stores only those offsets.
+- `test_ime_transpose_tile_ls.S`
+  - Configures `SEW=32`, `LMUL=1`, `lambda=2`, `VL=4`, `VLEN=256`.
+  - Subcase 1 checks `vmttl.v`/`vmtts.v` with explicit `LD=4` use transposed offsets `[0,4,1,5]` and leave non-addressed `dst` slots untouched.
+  - Subcase 2 checks `rs2=x0` natural `LD = VLEN / (SEW * lambda) = 4` (not the ordered `lambda * LMUL = 2`).
 - `test_ime_vmmacc.S`
   - Configures `SEW=32`, `LMUL=1`, `lambda=2`, `VL=4`, `VLEN=256`.
   - Checks a signed 4x2 by 2x2 non-widening GEMM and verifies inactive C tile columns remain untouched.
+- `test_ime_vwmmacc.S`
+  - Exercises all four W=2 widening rows at `VLEN=256`, `LMUL=1`:
+    - Row A Int16→Int32 (`SEW=32`, `lambda=2`, `VL=4`), signed/signed, plus a tail-stays-zero check.
+    - Row B Int8→Int16 (`SEW=16`, `lambda=4`, `VL=4`), mixed-sign (`altfmt_A=0` signed, `altfmt_B=1` unsigned with a packed 200).
+    - Row C Int32→Int64 (`SEW=64`, `lambda=2`, `VL=4`), unsigned/unsigned with a packed `0x80000001` to exercise the unsigned high bit.
+    - Row D Int4→Int8 (`SEW=8`, `lambda=4`, `VL=4`), signed/signed, exercising packed 4-bit nibble lanes.
+  - Expected C constants are produced by a scalar reference mirroring the `int_gemm` helper.
+- `test_ime_vqmmacc.S`
+  - Exercises the three valid W=4 widening rows at `VLEN=256`, `lambda=2`, `LMUL=1`, encoded as `.word 0xeac40857` (`vqmmacc.vv v16, v8, v12`):
+    - Row A Int8→Int32 (`SEW=32`, `VL=4`), signed/signed, the priority `vqwmmacc`/Ozaki-style path, plus a tail-stays-zero check.
+    - Row B Int8→Int32 (`SEW=32`, `VL=4`), unsigned/signed (`altfmt_A=1`, `altfmt_B=0`) with a packed unsigned 200 (`0xC8`).
+    - Row C Int4→Int16 (`SEW=16`, `VL=2`), unsigned/unsigned (`altfmt_A=altfmt_B=1`), exercising packed 4-bit nibble lanes including values `>= 8`.
+    - Row D Int16→Int64 (`SEW=64`, `VL=4`), signed/unsigned (`altfmt_A=0`, `altfmt_B=1`) with a packed unsigned 32769 (`0x8001`).
+  - Together the rows cover all four signedness combinations; expected C constants come from the same scalar reference mirroring the `int_gemm` helper.
+- `test_ime_v8wmmacc.S`
+  - Exercises the two valid W=8 widening rows at `VLEN=256`, encoded as `.word 0xeec40857` (`v8wmmacc.vv v16, v8, v12`):
+    - Rows A/B cover Int4→Int32 (`SEW=32`) signed/signed and unsigned/signed paths.
+    - Rows C/D cover Int8→Int64 (`SEW=64`) signed/signed and signed/unsigned paths, with Row D using `LMUL=2`.
+  - Expected C constants come from a scalar reference mirroring the `int_gemm` helper.
 - `test/first_party/src/ime_override.json`
-  - Enables `Zvvmm` and `Zvvmtls` for the targeted first-party tests.
+  - Enables `Zvvmm`, `Zvvmtls`, and `Zvvmttls` for the targeted first-party tests.
 - `model/unit_tests/test_ime_vtype.sail`
   - Covers lambda encoding helpers, lambda WARL selection, and the addressability of the new high `vtype` fields.
 
@@ -51,8 +105,8 @@ The initial IME tests live under `test/first_party/src/`:
 From the repository root:
 
 ```sh
-cmake --build build --target generated_sail_riscv_model sail_riscv_sim build_rv64d_test_ime_tile_ls.S build_rv64d_test_ime_vmmacc.S -j$(nproc)
-ctest --test-dir build -R 'first_party_rv64d_test_ime_(tile_ls|vmmacc)\.S' --output-on-failure -V
+cmake --build build --target generated_sail_riscv_model sail_riscv_sim build_rv64d_test_ime_v8wmmacc.S build_rv64d_test_ime_vqmmacc.S build_rv64d_test_ime_vwmmacc.S build_rv64d_test_ime_transpose_tile_ls.S build_rv64d_test_ime_tile_ls.S build_rv64d_test_ime_vmmacc.S -j$(nproc)
+ctest --test-dir build -R 'first_party_rv64d_test_ime_(v8wmmacc|vqmmacc|vwmmacc|transpose_tile_ls|tile_ls|vmmacc)\.S' --output-on-failure -V
 ```
 
 These commands assume the build directory has already been configured and that the local Sail and RISC-V first-party test toolchain prerequisites are available. The simulator runs the IME tests with:
@@ -61,30 +115,25 @@ These commands assume the build directory has already been configured and that t
 --enable-experimental-extensions --config build/config/rv64d_v256_e64.json --config-override test/first_party/src/ime_override.json
 ```
 
-Latest targeted verification in this workspace completed with both IME tests passing:
+Latest targeted verification in this workspace completed with all six IME tests passing:
 
 ```text
-100% tests passed, 0 tests failed out of 2
+100% tests passed, 0 tests failed out of 6
 ```
 
 ## Known limitations and shortcuts
 
-- Only the order-preserving tile load/store mode is implemented. Transposing tile load/store (`vmttl.v`, `vmtts.v`) currently decode to illegal instruction through the mode check or remain unimplemented.
-- Only `vmmacc.vv` W=1 non-widening integer GEMM is implemented. Widening integer instructions (`vwmmacc.vv`, `vqmmacc.vv`, `v8wmmacc.vv`), floating-point matrix instructions, and microscaling behavior are out of scope.
-- `vmmacc.vv` requires `vm=1` and `vstart=0` as in the draft restriction used for this loop; masked matrix multiply is not implemented.
+- Both the order-preserving and transposing tile load/store modes are implemented; the remaining reserved tile modes (`10`, `11`) decode to illegal instruction. Transposing only transposes `SEW`-bit storage elements and is exercised for `SEW=32`, `LMUL=1`, `lambda=2`, `VL=4`; broader lambda/LMUL/SEW coverage is not yet tested.
+- The `vmmacc.vv` (W=1), `vwmmacc.vv` (W=2), `vqmmacc.vv` (W=4), and `v8wmmacc.vv` (W=8) integer instruction encodings are enabled. Floating-point matrix instructions and microscaling behavior remain out of scope. No Int4 limitation: the packed-subelement helper represents 4-bit nibble lanes, so the Int4 rows for W=2, W=4, and W=8 are implemented and tested.
+- `vmmacc.vv`, `vwmmacc.vv`, `vqmmacc.vv`, and `v8wmmacc.vv` require `vm=1` and `vstart=0` as in the draft restriction used for this loop; masked matrix multiply is not implemented, and the `vm=0` microscaled forms (`vfwimmacc.vv`, `vfqmmacc.vv`, `vf8wimmacc.vv`, etc.) raise illegal instruction.
 - Integer row/subextension legality is simplified: enabling `Zvvmm` enables the initial non-widening integer rows implemented here instead of modeling each fine-grained row as a separate configuration flag.
-- C tile-tail columns are left undisturbed by the W=1 implementation; this matches the targeted test and should be revisited if the final spec requires tail-agnostic updates for inactive physical columns.
+- C tile-tail columns are left undisturbed by the integer GEMM implementation; this matches the targeted tests and should be revisited if the final spec requires tail-agnostic updates for inactive physical columns.
 - The first-party tests use `.word` instruction encodings for the new IME instructions so they do not depend on external assembler mnemonic support.
 - The implementation is still a targeted first loop, not a full conformance suite for all legal lambdas, LMULs, element widths, masking, traps, and exception restart behavior.
 
 ## Next-loop checklist
 
-1. Implement and test transposing tile load `vmttl.v`.
-2. Implement and test transposing tile store `vmtts.v`.
-3. Add widening integer matrix tests and implement `vwmmacc.vv`.
-4. Add quad-widening integer matrix tests and implement `vqmmacc.vv`.
-5. Add octuple-widening integer matrix tests and implement `v8wmmacc.vv`.
-6. Add the floating-point matrix instruction family.
-7. Add microscaling support and the associated `vtype.vbs` behavior.
-8. Replace simplified row/subextension legality with the full extension implication/configuration table once the draft naming is settled.
-9. Expand tests across lambda/LMUL/SEW combinations, masked/tail behavior, reserved encodings, and trap/restart cases.
+1. Add the floating-point matrix instruction family.
+2. Add microscaling support and the associated `vtype.vbs` behavior.
+3. Replace simplified row/subextension legality with the full extension implication/configuration table once the draft naming is settled.
+4. Expand tests across lambda/LMUL/SEW combinations, masked/tail behavior, reserved encodings, and trap/restart cases.

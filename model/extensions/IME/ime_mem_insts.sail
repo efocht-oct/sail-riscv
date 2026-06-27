@@ -330,3 +330,22 @@ mapping clause assembly = IMEVQMMACCTYPE(vm, vs2, vs1, vd)
 function clause execute IMEVQMMACCTYPE(vm, vs2, vs1, vd) =
   execute_ime_int_mmacc(4, vm, vs2, vs1, vd)
 
+// v8wmmacc.vv — octuple-widening (W=8) integer matrix multiply-accumulate. A and
+// B hold SEW/8-bit logical elements, eight packed per SEW-bit storage element,
+// and C accumulates at SEW. Only SEW in {32,64} is valid (EEW = SEW/8 in {4,8});
+// SEW in {8,16} would give the reserved EEW in {1,2} and is rejected by the
+// shared EEW legality check. `vm=1` selects this unscaled integer form; `vm=0`
+// is the reserved vf8wimmacc.vv microscaled encoding (not implemented), so it
+// falls through to the W-check / vm check in the shared dispatch and raises
+// illegal.
+union clause instruction = IMEV8WMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEV8WMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b111011 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b000 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvmm)
+
+mapping clause assembly = IMEV8WMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "v8wmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEV8WMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_int_mmacc(8, vm, vs2, vs1, vd)
