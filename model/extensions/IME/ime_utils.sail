@@ -105,6 +105,29 @@ function ime_tile_reg_idx(i : nat, group : nat, lambda_value : nat, elems_per_re
   regoff * elems_per_reg + elementoff
 }
 
+// Memory element offset for the order-preserving tile traversal. The active
+// tile is walked row-major across `linesize = lambda * LMUL` storage elements
+// per row: row = i / linesize, col = i % linesize, offset = row * LD + col.
+function ime_tile_ordered_mem_off(i : nat, linesize : nat, LD : nat) -> nat = {
+  assert(linesize > 0);
+  let row = i / linesize;
+  let col = i % linesize;
+  row * LD + col
+}
+
+// Memory element offset for the transposing tile traversal. The active tile
+// has `rows` storage-element rows and `cols = lambda * LMUL` storage-element
+// columns; the flat index i selects (row, col) row-major but addresses the
+// transpose: offset = col * LD + row. For a 2x2 tile with LD=4 this yields
+// the offsets [0, 4, 1, 5] for flat indices [0, 1, 2, 3].
+function ime_tile_transposed_mem_off(i : nat, rows : nat, cols : nat, LD : nat) -> nat = {
+  assert(cols > 0);
+  assert(rows > 0);
+  let row = i / cols;
+  let col = i % cols;
+  col * LD + row
+}
+
 function ime_mat_A_idx(i : nat, k : nat, K_eff : nat, LMUL : nat, lambda_value : nat, epr : nat) -> nat =
   ime_tile_reg_idx(i * K_eff + k, LMUL, lambda_value, epr)
 

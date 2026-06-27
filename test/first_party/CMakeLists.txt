@@ -114,6 +114,7 @@ macro(add_ime_test name march xlen override_json_file)
 endmacro()
 
 add_ime_test("test_ime_tile_ls.S" "rv64gcv_zvvmtls" 64 "ime_override.json")
+add_ime_test("test_ime_transpose_tile_ls.S" "rv64gcv_zvvmtls_zvvmttls" 64 "ime_override.json")
 add_ime_test("test_ime_vmmacc.S" "rv64gcv_zvvmm_zvvmtls" 64 "ime_override.json")
 
 list(LENGTH ime_tests ime_tests_len)

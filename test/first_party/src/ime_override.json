@@ -5,6 +5,9 @@
     },
     "Zvvmtls": {
       "supported": true
+    },
+    "Zvvmttls": {
+      "supported": true
     }
   }
 }

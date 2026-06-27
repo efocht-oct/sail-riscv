@@ -8,10 +8,12 @@ union clause instruction = VMTLTYPE : (bits(3), bits(1), ime_tile_mode, bits(1),
 
 mapping clause encdec = VMTLTYPE(lambda_field, L, mode, vm, rs2, rs1, vd)
   <-> lambda_field @ L @ encdec_ime_tile_mode(mode) @ vm @ encdec_reg(rs2) @ encdec_reg(rs1) @ 0b111 @ encdec_vreg(vd) @ 0b0000111
-  when currentlyEnabled(Ext_Zvvmtls)
+  when (mode == IME_TILE_ORDERED & currentlyEnabled(Ext_Zvvmtls)) |
+       (mode == IME_TILE_TRANSPOSED & currentlyEnabled(Ext_Zvvmttls))
 
 function clause execute VMTLTYPE(lambda_field, L, mode, vm, rs2, rs1, vd) = {
-  if mode != IME_TILE_ORDERED then return Illegal_Instruction();
+  if mode != IME_TILE_ORDERED & mode != IME_TILE_TRANSPOSED then return Illegal_Instruction();
+  let transposed : bool = mode == IME_TILE_TRANSPOSED;
 
   let SEW = get_sew();
   let SEW_bytes = get_sew_bytes();
@@ -26,9 +28,20 @@ function clause execute VMTLTYPE(lambda_field, L, mode, vm, rs2, rs1, vd) = {
      lambda_value == 0
   then return Illegal_Instruction();
 
-  let LMUL = 2 ^ max(LMUL_pow, 0);
-  let linesize = lambda_value * LMUL;
-  if linesize == 0 then return Illegal_Instruction();
+  let LMUL = ime_lmul_value_nat(LMUL_pow);
+  let lambda_nat = if L == 0b1 then ime_lambda_field_to_nat(lambda_field) else ime_lambda_field_to_nat(vtype[vlambda]);
+  let cols = lambda_nat * LMUL;
+  if cols == 0 then return Illegal_Instruction();
+  assert(lambda_nat > 0);
+  let VL = unsigned(vl);
+  let rows = VL / cols;
+  if transposed & rows == 0 then return Illegal_Instruction();
+
+  // rs2=x0 selects the natural leading dimension: lambda*LMUL for the
+  // order-preserving traversal, VLEN/(SEW*lambda) for the transposing one.
+  let LD : nat = if rs2 == zreg then {
+    if transposed then vlen / (SEW * lambda_nat) else cols
+  } else unsigned(X(rs2));
 
   let vm_val = read_vmask(num_elem, vm, zvreg);
   let vd_val = read_vreg(num_elem, SEW, LMUL_pow, vd);
@@ -37,18 +50,12 @@ function clause execute VMTLTYPE(lambda_field, L, mode, vm, rs2, rs1, vd) = {
   let 'm = SEW;
   let (result, mask) : (vector('n, bits('m)), bits('n)) = init_masked_result(num_elem, SEW, LMUL_pow, vd_val, vm_val);
 
-  let LD = unsigned(X(rs2));
-
   foreach (i from 0 to (num_elem - 1)) {
     if mask[i] == 0b1 then {
       set_vstart(to_bits_unsafe(16, i));
-      var row : int = 0;
-      var remaining : int = i;
-      while (remaining >= linesize) {
-        row = row + 1;
-        remaining = remaining - linesize
-      };
-      let mem_off = row * LD + remaining;
+      let mem_off = if transposed
+                    then ime_tile_transposed_mem_off(i, rows, cols, LD)
+                    else ime_tile_ordered_mem_off(i, cols, LD);
       let byte_offset = mem_off * SEW_bytes;
       match SEW {
         8  => match vmem_read(rs1, to_bits_unsafe(xlen, byte_offset), 1, Load(Vector), false, false, false) {
@@ -82,10 +89,12 @@ union clause instruction = VMTSTYPE : (bits(3), bits(1), ime_tile_mode, bits(1),
 
 mapping clause encdec = VMTSTYPE(lambda_field, L, mode, vm, rs2, rs1, vs3)
   <-> lambda_field @ L @ encdec_ime_tile_mode(mode) @ vm @ encdec_reg(rs2) @ encdec_reg(rs1) @ 0b111 @ encdec_vreg(vs3) @ 0b0100111
-  when currentlyEnabled(Ext_Zvvmtls)
+  when (mode == IME_TILE_ORDERED & currentlyEnabled(Ext_Zvvmtls)) |
+       (mode == IME_TILE_TRANSPOSED & currentlyEnabled(Ext_Zvvmttls))
 
 function clause execute VMTSTYPE(lambda_field, L, mode, vm, rs2, rs1, vs3) = {
-  if mode != IME_TILE_ORDERED then return Illegal_Instruction();
+  if mode != IME_TILE_ORDERED & mode != IME_TILE_TRANSPOSED then return Illegal_Instruction();
+  let transposed : bool = mode == IME_TILE_TRANSPOSED;
 
   let SEW = get_sew();
   let SEW_bytes = get_sew_bytes();
@@ -100,25 +109,31 @@ function clause execute VMTSTYPE(lambda_field, L, mode, vm, rs2, rs1, vs3) = {
      lambda_value == 0
   then return Illegal_Instruction();
 
-  let LMUL = 2 ^ max(LMUL_pow, 0);
-  let linesize = lambda_value * LMUL;
-  if linesize == 0 then return Illegal_Instruction();
+  let LMUL = ime_lmul_value_nat(LMUL_pow);
+  let lambda_nat = if L == 0b1 then ime_lambda_field_to_nat(lambda_field) else ime_lambda_field_to_nat(vtype[vlambda]);
+  let cols = lambda_nat * LMUL;
+  if cols == 0 then return Illegal_Instruction();
+  assert(lambda_nat > 0);
+  let VL = unsigned(vl);
+  let rows = VL / cols;
+  if transposed & rows == 0 then return Illegal_Instruction();
+
+  // rs2=x0 selects the natural leading dimension: lambda*LMUL for the
+  // order-preserving traversal, VLEN/(SEW*lambda) for the transposing one.
+  let LD : nat = if rs2 == zreg then {
+    if transposed then vlen / (SEW * lambda_nat) else cols
+  } else unsigned(X(rs2));
 
   let vm_val = read_vmask(num_elem, vm, zvreg);
   let 'n = num_elem;
   let mask : bits('n) = init_masked_source(num_elem, LMUL_pow, vm_val);
-  let LD = unsigned(X(rs2));
 
   foreach (i from 0 to (num_elem - 1)) {
     if mask[i] == 0b1 then {
       set_vstart(to_bits_unsafe(16, i));
-      var row : int = 0;
-      var remaining : int = i;
-      while (remaining >= linesize) {
-        row = row + 1;
-        remaining = remaining - linesize
-      };
-      let mem_off = row * LD + remaining;
+      let mem_off = if transposed
+                    then ime_tile_transposed_mem_off(i, rows, cols, LD)
+                    else ime_tile_ordered_mem_off(i, cols, LD);
       let byte_offset = mem_off * SEW_bytes;
       let data = read_single_element(SEW, i, vs3);
       match SEW {
