@@ -349,3 +349,132 @@ mapping clause assembly = IMEV8WMMACCTYPE(vm, vs2, vs1, vd)
 
 function clause execute IMEV8WMMACCTYPE(vm, vs2, vs1, vd) =
   execute_ime_int_mmacc(8, vm, vs2, vs1, vd)
+
+// Shared unscaled floating-point GEMM executor for the vfmmacc.vv family. The
+// tile/register geometry is identical to the integer execute_ime_int_gemm path
+// (it reuses the same ime_mat_A/B/C_idx helpers); only the accumulation is in
+// IEEE floating point via the SoftFloat helpers fp_mul/fp_add.
+//
+// This loop implements only the FP32 same-width row: W=1, SEW=EEW_C=32, and the
+// default IEEE C format. Wider/narrower FP rows (FP64/FP16/BF16/...) and the
+// widening W>1 packed-lane forms are staged separately and rejected as illegal
+// here.
+//
+// Disclosed reference profile for the implemented row: G=1, psm=0 (exact
+// per-product partial sum), rnd=frm. With G=1 and W=1 each group is a single
+// exact product A[i,k]*B[j,k]; rnd=frm rounds that product to the C format using
+// the dynamic frm (fp_mul), and the running accumulation C + S is then rounded
+// again under frm (fp_add). Both rounding points accrue exception flags into
+// fflags, and only active C columns (j < N) contribute flags.
+function execute_ime_fp_gemm(
+  EEW_C : sew_bitsize,
+  W : nat,
+  lambda_value : nat,
+  LMUL : nat,
+  rm_3b : bits(3),
+  vs1 : vregidx,
+  vs2 : vregidx,
+  vd : vregidx
+) -> ExecutionResult = {
+  assert(lambda_value > 0);
+  assert(LMUL > 0);
+  assert(W > 0);
+  assert(EEW_C * lambda_value > 0);
+  assert(EEW_C * lambda_value * lambda_value > 0);
+  let epr_C : nat = vlen / EEW_C;
+  let K_eff : nat = lambda_value * W * LMUL;
+  assert(K_eff > 0);
+  // Number of SEW-bit storage elements per matrix row along K. For W=1 this is
+  // K_eff; W>1 packing is not used by this FP32 row.
+  let storage_K : nat = lambda_value * LMUL;
+  assert(storage_K > 0);
+  let M : nat = vlen / (EEW_C * lambda_value);
+  let N_max : nat = M;
+  let EMUL_C : nat = vlen / (EEW_C * lambda_value * lambda_value);
+  let N : nat = unsigned(vl) / storage_K;
+  let EMUL_C_pow = ime_group_size_to_pow(EMUL_C);
+
+  // Only the FP32 same-width W=1 row is implemented in this loop.
+  if W != 1 then return Illegal_Instruction();
+  if EEW_C != 32 then return Illegal_Instruction();
+  if K_eff == 0 |
+     storage_K == 0 |
+     M == 0 |
+     N == 0 |
+     unsigned(vl) % storage_K != 0 |
+     N > N_max |
+     not(ime_group_size_legal(EMUL_C)) |
+     not(valid_reg_group(vd, EMUL_C_pow))
+  then return Illegal_Instruction();
+
+  foreach (j from 0 to (N - 1)) {
+    foreach (i from 0 to (M - 1)) {
+      let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+      var acc : bits(32) = read_single_element(32, c_flat, vd);
+      foreach (k from 0 to (K_eff - 1)) {
+        let storage_col = ime_packed_storage_col(k, W);
+        let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
+        let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
+        let a = read_single_element(32, a_flat, vs1);
+        let b = read_single_element(32, b_flat, vs2);
+        let prod = fp_mul(rm_3b, a, b);
+        acc = fp_add(rm_3b, acc, prod)
+      };
+      write_single_element(32, c_flat, vd, acc)
+    }
+  };
+
+  set_vstart(zeros());
+  RETIRE_SUCCESS
+}
+
+// Shared dispatch for the unscaled floating-point vfmmacc.vv family. Mirrors the
+// integer execute_ime_int_mmacc legality (vm=1-only, vstart=0, LMUL-aligned
+// input register groups) and additionally validates the FP operation/rounding
+// mode via valid_fp_op and requires default IEEE input formats (altfmt_A/B = 0).
+// `vm=0` is reserved for the microscaled FP form and raises illegal instruction.
+function execute_ime_fp_mmacc(W : nat, vm : bits(1), vs2 : vregidx, vs1 : vregidx, vd : vregidx) -> ExecutionResult = {
+  let SEW = get_sew();
+  let LMUL_pow = get_lmul_pow();
+  let rm_3b = fcsr[FRM];
+  let lambda_value = ime_lambda_field_to_value(vtype[vlambda]);
+  let lambda_nat = ime_lambda_field_to_nat(vtype[vlambda]);
+  let LMUL = ime_lmul_value_nat(LMUL_pow);
+
+  if vm != 0b1 |
+     not(valid_vtype()) |
+     not(valid_fp_op(SEW, rm_3b)) |
+     unsigned(vstart) != 0 |
+     vtype[altfmt_A] != 0b0 |
+     vtype[altfmt_B] != 0b0 |
+     lambda_value == 0 |
+     LMUL == 0 |
+     not(valid_reg_group(vs1, LMUL_pow)) |
+     not(valid_reg_group(vs2, LMUL_pow))
+  then return Illegal_Instruction();
+
+  // Only SEW=32 (FP32) is implemented in this loop; other widths are illegal.
+  match SEW {
+    8  => Illegal_Instruction(),
+    16 => Illegal_Instruction(),
+    32 => execute_ime_fp_gemm(32, W, lambda_nat, LMUL, rm_3b, vs1, vs2, vd),
+    64 => Illegal_Instruction(),
+  }
+}
+
+// vfmmacc.vv — non-widening (W=1) floating-point matrix multiply-accumulate.
+// A, B, and C are all SEW-bit IEEE floating-point values. This is the first
+// floating-point member of the IME GEMM family; only the FP32 (SEW=32) row is
+// implemented. `vm=1` selects the unscaled form; `vm=0` is the reserved
+// microscaled encoding (not implemented) and raises illegal instruction.
+union clause instruction = IMEVFMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEVFMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b010100 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b001 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvfmm)
+
+mapping clause assembly = IMEVFMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "vfmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEVFMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_fp_mmacc(1, vm, vs2, vs1, vd)

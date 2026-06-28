@@ -131,9 +131,49 @@ Latest targeted verification in this workspace completed with all six IME tests 
 - The first-party tests use `.word` instruction encodings for the new IME instructions so they do not depend on external assembler mnemonic support.
 - The implementation is still a targeted first loop, not a full conformance suite for all legal lambdas, LMULs, element widths, masking, traps, and exception restart behavior.
 
+
+## Planned floating-point vmmacc loop
+
+The next implementation loop adds unscaled floating-point matrix multiply-accumulate in the same staged style as the integer work. The plan follows the draft spec's Sail-like starting point for `fp_gemm`, but the first implementation is deliberately narrower than the full draft matrix.
+
+Initial disclosure for implemented unscaled FP rows:
+- Grouping: `G=1`.
+- Partial-sum mode: `psm=0` / exact-reference group formation, implemented initially through SoftFloat operations in the accumulator format for supported IEEE rows.
+- Group rounding: `rnd=frm`.
+- Microscaling (`v0.scale`/`vbs`) remains unimplemented and illegal/reserved for now.
+- Alternate C accumulator format selection (`altfmt` in the draft text) is not yet represented in this local `vtype`; the first loop therefore supports only default IEEE C formats and treats alternate/non-default formats as future work.
+
+Step-by-step staged order:
+1. Add helper plumbing for default IEEE FP operations and dynamic rounding-mode lookup:
+   - use `select_instr_or_fcsr_rm(RM_DYN)`-style behavior so reserved `frm` raises illegal instruction;
+   - use SoftFloat helpers from `model/core/softfloat_interface.sail`;
+   - OR returned exception flags into `fflags` with `accrue_fflags` only for active output computations.
+2. Implement and test FP32 same-width `vfmmacc.vv` first (`SEW=32`, W=1, `altfmt_A=altfmt_B=0`, `vm=1`). This is the simplest useful path because A, B, and C are all 32-bit IEEE values already supported by SoftFloat.
+3. Extend same-width `vfmmacc.vv` to FP64, then FP16 if the selected config has the required F/Zfh support enabled.
+4. Add `vfwmmacc.vv` FP16-to-FP32. Reuse the integer packed-storage mapping to extract raw 16-bit lanes from each 32-bit storage element, convert each input to FP32, multiply/add in FP32 under `frm`, and test exact values before rounding-sensitive cases.
+5. Add `vfwmmacc.vv` FP32-to-FP64 using the same pattern.
+6. Add wider/lower precision rows only after explicit decode helpers exist for the input format: BF16, OFP8, OFP4, mixed input formats, and non-default accumulator formats are not to be approximated by integer or IEEE reinterpretation.
+7. Add microscaled FP and integer-input FP-accumulate instructions only after unscaled FP rows are stable, because they require `v0.scale` layout, E8M0 decode, block-size legality, shortened groups, NaN-scale early termination, and scale-related exception flags.
+
+Test requirements for the FP loop:
+- First-party assembly tests should continue to use `.word` encodings until assembler mnemonic support exists.
+- FP32 W=1 smoke test: `SEW=32`, `LMUL=1`, `lambda=2`, `VL=4`, `VLEN=256`; verify a 4x2 by 2x2 exact matrix multiply-add and confirm inactive C tile columns remain unchanged.
+- Limited-vector-length test: set `VL=lambda*LMUL` so only one C/B column is active; place flag-generating sentinel values in inactive columns and verify they do not affect C or `fflags`.
+- Multiple-LMUL test: exercise `LMUL=2` with exact values to prove `K_eff=lambda*LMUL` and register-step traversal.
+- Rounding tests: after confirming the disclosure (`G=1`, `psm=0`, `rnd=frm`) with the user, add RNE plus at least one directed mode such as RTZ/RDN and check result bits and `NX`.
+- Special-value tests: sNaN invalid, `0*inf` invalid, qNaN/default-NaN behavior, and inactive/tail non-participation.
+- Illegal/reserved tests: `vm=0` for `vfmmacc`, nonzero `vstart`, bad `VL` divisibility, misaligned register groups, unsupported alternate formats, `vfqmmacc` with `SEW=8`, and `vf8wmmacc` with `SEW<32`.
+
+Open questions before broadening scope:
+1. Whether to add the draft spec's separate C `altfmt` vtype bit now or keep this local model to default C formats until the vtype layout is settled.
+2. Whether `G=1, psm=0, rnd=frm` is the desired architectural disclosure for the initial reference implementation, or whether a fused/`rnd=xct` profile is preferred.
+3. Whether `Zvvfmm` should remain the coarse gate for all default IEEE FP rows in this repo or be replaced with fine-grained draft row extensions before lower-precision rows are enabled.
+
 ## Next-loop checklist
 
-1. Add the floating-point matrix instruction family.
-2. Add microscaling support and the associated `vtype.vbs` behavior.
-3. Replace simplified row/subextension legality with the full extension implication/configuration table once the draft naming is settled.
-4. Expand tests across lambda/LMUL/SEW combinations, masked/tail behavior, reserved encodings, and trap/restart cases.
+1. Add FP32 same-width `vfmmacc.vv` and its focused first-party tests.
+2. Add FP64/FP16 same-width `vfmmacc.vv` only after the FP32 path is green and the required base FP extensions are confirmed in config.
+3. Add unscaled `vfwmmacc.vv` lower-precision IEEE rows (FP16→FP32, then FP32→FP64) with packed raw-lane extraction and rounding tests.
+4. Add microscaling support and the associated `vtype.vbs` behavior after unscaled FP is stable.
+5. Replace simplified row/subextension legality with the full extension implication/configuration table once the draft naming is settled.
+6. Expand tests across lambda/LMUL/SEW combinations, masked/tail behavior, reserved encodings, and trap/restart cases.
