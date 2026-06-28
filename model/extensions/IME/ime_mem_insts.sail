@@ -350,28 +350,85 @@ mapping clause assembly = IMEV8WMMACCTYPE(vm, vs2, vs1, vd)
 function clause execute IMEV8WMMACCTYPE(vm, vs2, vs1, vd) =
   execute_ime_int_mmacc(8, vm, vs2, vs1, vd)
 
+function ime_bf16_to_f32_set_flags(v : bits(16)) -> bits(32) = {
+  let sign = v[15 .. 15];
+  let exp = v[14 .. 7];
+  let mant = v[6 .. 0];
+  let is_nan = exp == ones() & mant != zeros();
+  let is_inf = exp == ones() & mant == zeros();
+  let fflags = if is_nan & signed(mant) >= 0 then nvFlag() else zeros();
+  let value = if is_nan then canonical_NaN_S()
+              else if is_inf then fmake_S(sign, ones(), zeros())
+              else fmake_S(sign, exp, mant @ zeros(16));
+  accrue_fflags(fflags);
+  value
+}
+
+function ime_fp16_to_fp32_set_flags(rm_3b : bits(3), v : bits(16)) -> bits(32) = {
+  let (fflags, value) = riscv_f16ToF32(rm_3b, v);
+  accrue_fflags(fflags);
+  value
+}
+
+function ime_fp16_to_fp64_set_flags(rm_3b : bits(3), v : bits(16)) -> bits(64) = {
+  let (fflags, value) = riscv_f16ToF64(rm_3b, v);
+  accrue_fflags(fflags);
+  value
+}
+
+function ime_fp32_to_fp64_set_flags(rm_3b : bits(3), v : bits(32)) -> bits(64) = {
+  let (fflags, value) = riscv_f32ToF64(rm_3b, v);
+  accrue_fflags(fflags);
+  value
+}
+
+function ime_bf16_to_fp64_set_flags(rm_3b : bits(3), v : bits(16)) -> bits(64) =
+  ime_fp32_to_fp64_set_flags(rm_3b, ime_bf16_to_f32_set_flags(v))
+
+function ime_fp16_or_bf16_to_fp32(rm_3b : bits(3), altfmt : bits(1), v : bits(16)) -> bits(32) =
+  if altfmt == 0b0 then ime_fp16_to_fp32_set_flags(rm_3b, v)
+  else ime_bf16_to_f32_set_flags(v)
+
+function ime_fp16_or_bf16_to_fp64(rm_3b : bits(3), altfmt : bits(1), v : bits(16)) -> bits(64) =
+  if altfmt == 0b0 then ime_fp16_to_fp64_set_flags(rm_3b, v)
+  else ime_bf16_to_fp64_set_flags(rm_3b, v)
+
+function ime_lane16_from32(storage : bits(32), lane : nat) -> bits(16) =
+  if lane == 0 then storage[15 .. 0] else storage[31 .. 16]
+
+function ime_lane16_from64(storage : bits(64), lane : nat) -> bits(16) =
+  if lane == 0 then storage[15 .. 0]
+  else if lane == 1 then storage[31 .. 16]
+  else if lane == 2 then storage[47 .. 32]
+  else storage[63 .. 48]
+
+function ime_lane32_from64(storage : bits(64), lane : nat) -> bits(32) =
+  if lane == 0 then storage[31 .. 0] else storage[63 .. 32]
+
 // Shared unscaled floating-point GEMM executor for the vfmmacc.vv family. The
 // tile/register geometry is identical to the integer execute_ime_int_gemm path
 // (it reuses the same ime_mat_A/B/C_idx helpers); only the accumulation is in
 // IEEE floating point via the SoftFloat helpers fp_mul/fp_add.
 //
-// This loop implements only the FP32 same-width row: W=1, SEW=EEW_C=32, and the
-// default IEEE C format. Wider/narrower FP rows (FP64/FP16/BF16/...) and the
-// widening W>1 packed-lane forms are staged separately and rejected as illegal
-// here.
+// Implemented rows in this staged loop:
+//   W=1: FP16, FP32, FP64 same-width (default IEEE C format).
+//   W=2: FP16/BF16 -> FP32 and FP32 -> FP64.
+//   W=4: FP16/BF16 -> FP64.
+// Microscaled vm=0, OFP4/OFP8, integer-input FP-accumulate, and non-default C
+// altfmt remain out of scope and are rejected by the dispatch.
 //
-// Disclosed reference profile for the implemented row: G=1, psm=0 (exact
-// per-product partial sum), rnd=frm. With G=1 and W=1 each group is a single
-// exact product A[i,k]*B[j,k]; rnd=frm rounds that product to the C format using
-// the dynamic frm (fp_mul), and the running accumulation C + S is then rounded
-// again under frm (fp_add). Both rounding points accrue exception flags into
-// fflags, and only active C columns (j < N) contribute flags.
+// Disclosed reference profile for the implemented rows: G=1, psm=0 (exact
+// per-product partial sum), rnd=frm. Each product is rounded to the C format and
+// then accumulated into C under the dynamic frm. Both rounding points accrue
+// exception flags into fflags, and only active C columns (j < N) contribute flags.
 function execute_ime_fp_gemm(
   EEW_C : sew_bitsize,
   W : nat,
   lambda_value : nat,
   LMUL : nat,
   rm_3b : bits(3),
+  altfmt_A : bits(1),
+  altfmt_B : bits(1),
   vs1 : vregidx,
   vs2 : vregidx,
   vd : vregidx
@@ -384,8 +441,8 @@ function execute_ime_fp_gemm(
   let epr_C : nat = vlen / EEW_C;
   let K_eff : nat = lambda_value * W * LMUL;
   assert(K_eff > 0);
-  // Number of SEW-bit storage elements per matrix row along K. For W=1 this is
-  // K_eff; W>1 packing is not used by this FP32 row.
+  // Number of SEW-bit storage elements per matrix row along K. W narrow logical
+  // elements are packed into each storage element for the widening rows.
   let storage_K : nat = lambda_value * LMUL;
   assert(storage_K > 0);
   let M : nat = vlen / (EEW_C * lambda_value);
@@ -394,9 +451,11 @@ function execute_ime_fp_gemm(
   let N : nat = unsigned(vl) / storage_K;
   let EMUL_C_pow = ime_group_size_to_pow(EMUL_C);
 
-  // Only the FP32 same-width W=1 row is implemented in this loop.
-  if W != 1 then return Illegal_Instruction();
-  if EEW_C != 32 then return Illegal_Instruction();
+  let EEW : nat = EEW_C / W;
+
+  if W != 1 & W != 2 & W != 4 then return Illegal_Instruction();
+  if EEW_C % W != 0 then return Illegal_Instruction();
+  if not(EEW == 16 | EEW == 32 | EEW == 64) then return Illegal_Instruction();
   if K_eff == 0 |
      storage_K == 0 |
      M == 0 |
@@ -407,21 +466,110 @@ function execute_ime_fp_gemm(
      not(valid_reg_group(vd, EMUL_C_pow))
   then return Illegal_Instruction();
 
-  foreach (j from 0 to (N - 1)) {
-    foreach (i from 0 to (M - 1)) {
-      let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
-      var acc : bits(32) = read_single_element(32, c_flat, vd);
-      foreach (k from 0 to (K_eff - 1)) {
-        let storage_col = ime_packed_storage_col(k, W);
-        let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
-        let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
-        let a = read_single_element(32, a_flat, vs1);
-        let b = read_single_element(32, b_flat, vs2);
-        let prod = fp_mul(rm_3b, a, b);
-        acc = fp_add(rm_3b, acc, prod)
-      };
-      write_single_element(32, c_flat, vd, acc)
-    }
+  match (EEW_C, W) {
+    (16, 1) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(16) = read_single_element(16, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let a_flat = ime_mat_A_idx(i, k, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(k, j, storage_K, LMUL, lambda_value, epr_C);
+            let prod = fp_mul(rm_3b, read_single_element(16, a_flat, vs1), read_single_element(16, b_flat, vs2));
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(16, c_flat, vd, acc)
+        }
+      }
+    },
+    (32, 1) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(32) = read_single_element(32, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let a_flat = ime_mat_A_idx(i, k, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(k, j, storage_K, LMUL, lambda_value, epr_C);
+            let prod = fp_mul(rm_3b, read_single_element(32, a_flat, vs1), read_single_element(32, b_flat, vs2));
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(32, c_flat, vd, acc)
+        }
+      }
+    },
+    (64, 1) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(64) = read_single_element(64, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let a_flat = ime_mat_A_idx(i, k, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(k, j, storage_K, LMUL, lambda_value, epr_C);
+            let prod = fp_mul(rm_3b, read_single_element(64, a_flat, vs1), read_single_element(64, b_flat, vs2));
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(64, c_flat, vd, acc)
+        }
+      }
+    },
+    (32, 2) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(32) = read_single_element(32, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let storage_col = ime_packed_storage_col(k, W);
+            let lane = ime_packed_lane(k, W);
+            let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
+            let a = ime_fp16_or_bf16_to_fp32(rm_3b, altfmt_A, ime_lane16_from32(read_single_element(32, a_flat, vs1), lane));
+            let b = ime_fp16_or_bf16_to_fp32(rm_3b, altfmt_B, ime_lane16_from32(read_single_element(32, b_flat, vs2), lane));
+            let prod = fp_mul(rm_3b, a, b);
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(32, c_flat, vd, acc)
+        }
+      }
+    },
+    (64, 2) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(64) = read_single_element(64, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let storage_col = ime_packed_storage_col(k, W);
+            let lane = ime_packed_lane(k, W);
+            let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
+            let a = ime_fp32_to_fp64_set_flags(rm_3b, ime_lane32_from64(read_single_element(64, a_flat, vs1), lane));
+            let b = ime_fp32_to_fp64_set_flags(rm_3b, ime_lane32_from64(read_single_element(64, b_flat, vs2), lane));
+            let prod = fp_mul(rm_3b, a, b);
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(64, c_flat, vd, acc)
+        }
+      }
+    },
+    (64, 4) => {
+      foreach (j from 0 to (N - 1)) {
+        foreach (i from 0 to (M - 1)) {
+          let c_flat = ime_mat_C_idx(i, j, N_max, EMUL_C, lambda_value, epr_C);
+          var acc : bits(64) = read_single_element(64, c_flat, vd);
+          foreach (k from 0 to (K_eff - 1)) {
+            let storage_col = ime_packed_storage_col(k, W);
+            let lane = ime_packed_lane(k, W);
+            let a_flat = ime_mat_A_idx(i, storage_col, storage_K, LMUL, lambda_value, epr_C);
+            let b_flat = ime_mat_B_idx(storage_col, j, storage_K, LMUL, lambda_value, epr_C);
+            let a = ime_fp16_or_bf16_to_fp64(rm_3b, altfmt_A, ime_lane16_from64(read_single_element(64, a_flat, vs1), lane));
+            let b = ime_fp16_or_bf16_to_fp64(rm_3b, altfmt_B, ime_lane16_from64(read_single_element(64, b_flat, vs2), lane));
+            let prod = fp_mul(rm_3b, a, b);
+            acc = fp_add(rm_3b, acc, prod)
+          };
+          write_single_element(64, c_flat, vd, acc)
+        }
+      }
+    },
+    _ => return Illegal_Instruction()
   };
 
   set_vstart(zeros());
@@ -431,8 +579,8 @@ function execute_ime_fp_gemm(
 // Shared dispatch for the unscaled floating-point vfmmacc.vv family. Mirrors the
 // integer execute_ime_int_mmacc legality (vm=1-only, vstart=0, LMUL-aligned
 // input register groups) and additionally validates the FP operation/rounding
-// mode via valid_fp_op and requires default IEEE input formats (altfmt_A/B = 0).
-// `vm=0` is reserved for the microscaled FP form and raises illegal instruction.
+// mode via valid_fp_op. `vm=0` is reserved for microscaled forms in this staged
+// implementation and raises illegal instruction.
 function execute_ime_fp_mmacc(W : nat, vm : bits(1), vs2 : vregidx, vs1 : vregidx, vd : vregidx) -> ExecutionResult = {
   let SEW = get_sew();
   let LMUL_pow = get_lmul_pow();
@@ -445,28 +593,30 @@ function execute_ime_fp_mmacc(W : nat, vm : bits(1), vs2 : vregidx, vs1 : vregid
      not(valid_vtype()) |
      not(valid_fp_op(SEW, rm_3b)) |
      unsigned(vstart) != 0 |
-     vtype[altfmt_A] != 0b0 |
-     vtype[altfmt_B] != 0b0 |
      lambda_value == 0 |
      LMUL == 0 |
      not(valid_reg_group(vs1, LMUL_pow)) |
      not(valid_reg_group(vs2, LMUL_pow))
   then return Illegal_Instruction();
 
-  // Only SEW=32 (FP32) is implemented in this loop; other widths are illegal.
+  if W == 1 & (vtype[altfmt_A] != 0b0 | vtype[altfmt_B] != 0b0) then return Illegal_Instruction();
+  if W == 2 & SEW == 64 & (vtype[altfmt_A] != 0b0 | vtype[altfmt_B] != 0b0) then return Illegal_Instruction();
+  if W == 2 & SEW == 16 then return Illegal_Instruction();
+  if W == 4 & SEW != 64 then return Illegal_Instruction();
+  if W != 1 & W != 2 & W != 4 then return Illegal_Instruction();
+
   match SEW {
     8  => Illegal_Instruction(),
-    16 => Illegal_Instruction(),
-    32 => execute_ime_fp_gemm(32, W, lambda_nat, LMUL, rm_3b, vs1, vs2, vd),
-    64 => Illegal_Instruction(),
+    16 => execute_ime_fp_gemm(16, W, lambda_nat, LMUL, rm_3b, vtype[altfmt_A], vtype[altfmt_B], vs1, vs2, vd),
+    32 => execute_ime_fp_gemm(32, W, lambda_nat, LMUL, rm_3b, vtype[altfmt_A], vtype[altfmt_B], vs1, vs2, vd),
+    64 => execute_ime_fp_gemm(64, W, lambda_nat, LMUL, rm_3b, vtype[altfmt_A], vtype[altfmt_B], vs1, vs2, vd),
   }
 }
 
 // vfmmacc.vv — non-widening (W=1) floating-point matrix multiply-accumulate.
-// A, B, and C are all SEW-bit IEEE floating-point values. This is the first
-// floating-point member of the IME GEMM family; only the FP32 (SEW=32) row is
-// implemented. `vm=1` selects the unscaled form; `vm=0` is the reserved
-// microscaled encoding (not implemented) and raises illegal instruction.
+// A, B, and C are all SEW-bit IEEE floating-point values. `vm=1` selects the
+// unscaled form; `vm=0` is the reserved microscaled encoding (not implemented)
+// and raises illegal instruction.
 union clause instruction = IMEVFMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
 
 mapping clause encdec = IMEVFMMACCTYPE(vm, vs2, vs1, vd)
@@ -478,3 +628,33 @@ mapping clause assembly = IMEVFMMACCTYPE(vm, vs2, vs1, vd)
 
 function clause execute IMEVFMMACCTYPE(vm, vs2, vs1, vd) =
   execute_ime_fp_mmacc(1, vm, vs2, vs1, vd)
+
+// vfwmmacc.vv — double-widening (W=2) floating-point matrix
+// multiply-accumulate. A/B are packed SEW/2 inputs and C accumulates at SEW;
+// vm=0 selects microscaling in the draft ISA and is not implemented here.
+union clause instruction = IMEVFWMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEVFWMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b010101 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b001 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvfmm)
+
+mapping clause assembly = IMEVFWMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "vfwmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEVFWMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_fp_mmacc(2, vm, vs2, vs1, vd)
+
+// vfqmmacc.vv — quad-widening (W=4) floating-point matrix
+// multiply-accumulate. This staged implementation accepts only SEW=64 with
+// packed FP16/BF16 inputs; vm=0 microscaling remains illegal.
+union clause instruction = IMEVFQMMACCTYPE : (bits(1), vregidx, vregidx, vregidx)
+
+mapping clause encdec = IMEVFQMMACCTYPE(vm, vs2, vs1, vd)
+  <-> 0b010110 @ vm @ encdec_vreg(vs2) @ encdec_vreg(vs1) @ 0b001 @ encdec_vreg(vd) @ 0b1010111
+  when currentlyEnabled(Ext_Zvvfmm)
+
+mapping clause assembly = IMEVFQMMACCTYPE(vm, vs2, vs1, vd)
+  <-> "vfqmmacc.vv" ^ spc() ^ vreg_name(vd) ^ sep() ^ vreg_name(vs1) ^ sep() ^ vreg_name(vs2) ^ maybe_vmask(vm)
+
+function clause execute IMEVFQMMACCTYPE(vm, vs2, vs1, vd) =
+  execute_ime_fp_mmacc(4, vm, vs2, vs1, vd)
